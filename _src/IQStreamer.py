@@ -1,18 +1,23 @@
-import keyboard
+# Import built-in libraries
 import time
-import curses
 import socket
-import numpy as np
 import sys
 import os
 import os.path
 from os.path import join
-from iq_header import IQHeader
 import logging
 from struct import *
+import queue
+from threading import Thread
 import shutil
+import curses
 
+# Import third-party libraries
+from sshkeyboard import listen_keyboard, stop_listening
+import numpy as np
 from configparser import ConfigParser
+
+from iq_header import IQHeader
 
 """
     HeIMDALL-RTL
@@ -37,11 +42,17 @@ from configparser import ConfigParser
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+key_control_queue = queue.Queue()
+
+async def key_press(key):
+    if key_control_queue.empty():
+        key_control_queue.put(key)    
+    
 class IQStreamer:
     
     def __init__(self):
         
-        logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
         
         # IQ Frame recording       
@@ -81,9 +92,8 @@ class IQStreamer:
         self.last_frame_index = 0
         
         self.dropped_cpis = 0
-        self.last_cpi_index = 0
+        self.last_cpi_index = 0        
         
-        curses.wrapper(self.main)
     
     def _read_config_file(self, config_filename):
         """
@@ -125,91 +135,93 @@ class IQStreamer:
         stdscr.keypad(1)
             
         las_status_update =0
-        while True: 
+        while True:             
             start_time = time.time()
             self.status_update_cntr +=1            
             ###########################
             #     Keyboard events     #
             ###########################
-            # Exit command
-            if keyboard.is_pressed('q'):        
-                break  # finishing the loop
-            
-            # Create Ethernet connection
-            elif keyboard.is_pressed('c'):
-                if not self.receiver_connection_status:
-                    if self.connect() == 0:
-                        self.status_msg = "Connection established with " + self.rec_ip_addr                    
-                    else:
-                        self.status_msg = "Establishing connection failed with " + self.rec_ip_addr
-                    las_status_update = self.status_update_cntr
-            
-            # Disconnect from IQ Server
-            elif keyboard.is_pressed('d'):  
-                if self.close() == 0:
-                    self.status_msg = "IQ server connection closed "
-                else:
-                    self.status_msg = "Failed to close IQ server connection "                
-                las_status_update = self.status_update_cntr
+            if not key_control_queue.empty():                
+                key = key_control_queue.get()
                 
-            # Enable IQ recording
-            elif keyboard.is_pressed('r'):  
-                if not self.en_save_iq:
-                    self.en_save_iq = True
-                    self.status_msg = "Start recording"
-                    self.recorded_frames = 0
-                    
-                    # Generate folder structure
-                    # -> Automatic data set folder creation
-                    all_subdirs = [join(self.iq_record_path,d) for d in os.listdir(self.iq_record_path) if os.path.isdir(join(self.iq_record_path,d))]
-                    if len(all_subdirs):
-                        latest_subdir    = max(all_subdirs, key=os.path.getmtime)
-                        record_index     = int(os.path.basename(latest_subdir))
+                # Exit command                
+                if key == 'q':
+                    break  # finishing the loop
+                # Create Ethernet connection
+                elif key == 'c':
+                    if not self.receiver_connection_status:
+                        if self.connect() == 0:
+                            self.status_msg = "Connection established with " + self.rec_ip_addr                    
+                        else:
+                            self.status_msg = "Establishing connection failed with " + self.rec_ip_addr
+                        las_status_update = self.status_update_cntr
+                
+                # Disconnect from IQ Server
+                elif key == 'd':  
+                    if self.close() == 0:
+                        self.status_msg = "IQ server connection closed "
                     else:
-                        record_index = -1
+                        self.status_msg = "Failed to close IQ server connection "                
+                    las_status_update = self.status_update_cntr
+                    
+                # Enable IQ recording
+                elif key == 'r':  
+                    if not self.en_save_iq:
+                        self.en_save_iq = True
+                        self.status_msg = "Start recording"
+                        self.recorded_frames = 0
                         
-                    record_id = "{:04d}".format(record_index+1)
+                        # Generate folder structure
+                        # -> Automatic data set folder creation
+                        all_subdirs = [join(self.iq_record_path,d) for d in os.listdir(self.iq_record_path) if os.path.isdir(join(self.iq_record_path,d))]
+                        if len(all_subdirs):
+                            latest_subdir    = max(all_subdirs, key=os.path.getmtime)
+                            record_index     = int(os.path.basename(latest_subdir))
+                        else:
+                            record_index = -1
+                            
+                        record_id = "{:04d}".format(record_index+1)
 
-                    base_path         = join(self.iq_record_path, record_id)
-                    iq_path           = join(base_path, "iq")
-                    res_path          = join(base_path, "results")
-                    target_info_path  = join(base_path, "target_info")
+                        base_path         = join(self.iq_record_path, record_id)
+                        iq_path           = join(base_path, "iq")
+                        res_path          = join(base_path, "results")
+                        target_info_path  = join(base_path, "target_info")
 
-                    os.makedirs(base_path) 
-                    os.makedirs(iq_path) 
-                    os.makedirs(res_path) 
-                    os.makedirs(target_info_path)
-                    
-                    self.fname_prefix = iq_path
-            
-            # Disable IQ recording
-            elif keyboard.is_pressed('t'):  
-                if self.en_save_iq:
-                    self.en_save_iq = False
-                    self.status_msg = "Stop recording"
-                las_status_update = self.status_update_cntr
-            
-            # Start streaming
-            elif keyboard.is_pressed('s'):  
-                if not self.en_streaming:
-                    self.en_streaming = True
-                    self.status_msg = "Start streaming"
-                    
-                    # Open file descriptor for streaming
-                    self.stream_descriptor=open(self.stream_fname, "wb")
+                        os.makedirs(base_path) 
+                        os.makedirs(iq_path) 
+                        os.makedirs(res_path) 
+                        os.makedirs(target_info_path)
+                        
+                        self.fname_prefix = iq_path
+                
+                # Disable IQ recording
+                elif key == 't':  
+                    if self.en_save_iq:
+                        self.en_save_iq = False
+                        self.status_msg = "Stop recording"
+                    las_status_update = self.status_update_cntr
+                
+                # Start streaming
+                elif key == 's':  
+                    if not self.en_streaming:
+                        self.en_streaming = True
+                        self.status_msg = "Start streaming"
+                        
+                        # Open file descriptor for streaming
+                        self.stream_descriptor=open(self.stream_fname, "wb")
 
-                las_status_update = self.status_update_cntr
-            
-            # Stop streaming
-            elif keyboard.is_pressed('x'):  
-                if self.en_streaming:
-                    self.en_streaming = False
-                    self.status_msg = "Stop streaming"
-                    
-                    # Close stream file descriptor
-                    self.stream_descriptor.close()
+                    las_status_update = self.status_update_cntr
+                
+                # Stop streaming
+                elif key == 'x':  
+                    if self.en_streaming:
+                        self.en_streaming = False
+                        self.status_msg = "Stop streaming"
+                        
+                        # Close stream file descriptor
+                        self.stream_descriptor.close()
 
-                las_status_update = self.status_update_cntr
+                    las_status_update = self.status_update_cntr
             
             else:
                 if self.status_update_cntr > las_status_update+10: 
@@ -248,12 +260,12 @@ class IQStreamer:
                     self.stream_descriptor.write(self.iq_frame_bytes)
                 
             else:
-                time.sleep(0.01)                        
+                time.sleep(0.2)                        
             ###########################
             #      Status display     #
             ###########################     
             
-            # -> Connection status color
+            # -> Connection status color0
             if self.receiver_connection_status:
                 conn_status_str = "Connected"
                 conn_color=2
@@ -352,7 +364,7 @@ class IQStreamer:
             
             stdscr.clear()
             stdscr.addstr(0,  0,"--->HeIMDALL IQ Frame Streamer and Recorder<---")
-            stdscr.addstr(1,  0,"Version: 0.1")            
+            stdscr.addstr(1,  0,"Version: 1.0-230721")            
             stdscr.addstr(2,  0,"q   : exit program")
             stdscr.addstr(3,  0,"c/d : Connection/Disconnect IQ server")
             stdscr.addstr(4,  0,"s/x : Start/Stop streaming to file")
@@ -377,6 +389,7 @@ class IQStreamer:
             stdscr.addstr(24, 0, "Status: "+self.status_msg)
             
             stdscr.refresh()
+        stdscr.keypad(0)
     def connect(self):        
         """
             Compatible only with DAQ firmwares that has the IQ streaming mode. 
@@ -502,4 +515,22 @@ class IQStreamer:
 #           M A I N
 #
 ###############################
+
+def keyboard_task():
+    listen_keyboard(on_press=key_press)    
+
+thread = Thread(target = keyboard_task)
+thread.start()
+
 IQStreamer_inst0 = IQStreamer()
+curses.wrapper(IQStreamer_inst0.main)
+stop_listening()
+thread.join()
+
+# Set everything back to normal
+curses.echo() 
+curses.nocbreak()
+curses.endwin()  # Terminate curses
+
+
+
