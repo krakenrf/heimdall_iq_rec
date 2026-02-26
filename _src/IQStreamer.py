@@ -9,6 +9,7 @@ import logging
 from struct import *
 import queue
 from threading import Thread
+import threading
 import shutil
 import curses
 
@@ -47,7 +48,40 @@ key_control_queue = queue.Queue()
 async def key_press(key):
     if key_control_queue.empty():
         key_control_queue.put(key)    
+
+def iq_writer_thread(outdir, q, mode="naive"):
+    """
+    Writer thread function for IQ data frames
     
+    Args:
+        outdir: Output directory path
+        q: Queue containing (frame_data, filename) tuples
+        mode: Writing mode ("naive" for simple write)
+    """
+    seq = 0
+    while True:
+        item = q.get()
+        if item is None:  # poison pill
+            break
+        
+        frame_data, filename = item
+        t0 = time.perf_counter()
+        
+        if mode == "naive":
+            with open(filename, "wb") as f:
+                f.write(frame_data)
+        else:
+            # Future: implement fsync, dsync modes here
+            with open(filename, "wb") as f:
+                f.write(frame_data)
+        
+        dt = time.perf_counter() - t0
+        frame_size_mb = len(frame_data) / (1024 * 1024)
+        mbps = frame_size_mb / dt if dt > 0 else 0
+        logging.debug(f"[IQ_WRITE] seq={seq:06d} t={dt:.3f}s rate={mbps:.1f} MiB/s mode={mode}")
+        seq += 1
+        q.task_done()
+
 class IQStreamer:
     
     def __init__(self):
@@ -64,6 +98,13 @@ class IQStreamer:
         self.iq_record_path = ""
         self.fname_prefix   = ""
         self.progress_bar_length = 30
+        
+        # Writer thread components
+        self.writer_queue = None
+        self.writer_thread = None
+        self.writer_mode = "naive"  # Writing mode: naive, fsync, dsync
+        self.queue_depth = 15  # Maximum queue depth
+        self.dropped_write_frames = 0
         
         # Streaming
         self.en_streaming  = False
@@ -122,6 +163,27 @@ class IQStreamer:
               
         return 0
     
+    def _start_writer_thread(self):
+        """Start the writer thread for IQ data recording"""
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            self.writer_queue = queue.Queue(maxsize=self.queue_depth)
+            self.writer_thread = threading.Thread(
+                target=iq_writer_thread, 
+                args=(self.fname_prefix, self.writer_queue, self.writer_mode), 
+                daemon=True
+            )
+            self.writer_thread.start()
+            self.dropped_write_frames = 0
+    
+    def _stop_writer_thread(self):
+        """Stop the writer thread for IQ data recording"""
+        if self.writer_thread is not None and self.writer_thread.is_alive():
+            # Send poison pill to stop the thread
+            self.writer_queue.put(None)
+            self.writer_thread.join(timeout=5)
+            self.writer_thread = None
+            self.writer_queue = None
+    
     def main(self, stdscr):
         
         #stdscr = curses.initscr()
@@ -146,6 +208,9 @@ class IQStreamer:
                 
                 # Exit command                
                 if key == 'q':
+                    # Stop writer thread before exiting
+                    if self.en_save_iq:
+                        self._stop_writer_thread()
                     break  # finishing the loop
                 # Create Ethernet connection
                 elif key == 'c':
@@ -193,12 +258,18 @@ class IQStreamer:
                         os.makedirs(target_info_path)
                         
                         self.fname_prefix = iq_path
+                        
+                        # Start the writer thread
+                        self._start_writer_thread()
                 
                 # Disable IQ recording
                 elif key == 't':  
                     if self.en_save_iq:
                         self.en_save_iq = False
                         self.status_msg = "Stop recording"
+                        
+                        # Stop the writer thread
+                        self._stop_writer_thread()
                     las_status_update = self.status_update_cntr
                 
                 # Start streaming
@@ -253,8 +324,16 @@ class IQStreamer:
 
                 if self.en_save_iq and check_frame_flag:
                     self.recorded_frames +=1
-                    self.recorded_data_size += self.frame_size                         
-                    self.save_ig(join(self.fname_prefix, "{:04d}".format(self.recorded_frames)))
+                    self.recorded_data_size += self.frame_size
+                    
+                    # Queue the frame for writing instead of direct write
+                    filename = join(self.fname_prefix, "{:04d}.iqf".format(self.recorded_frames))
+                    try:
+                        if self.writer_queue is not None:
+                            self.writer_queue.put_nowait((self.iq_frame_bytes, filename))
+                    except queue.Full:
+                        self.dropped_write_frames += 1
+                        self.logger.warning(f"Writer queue full! Dropped frame {self.recorded_frames}. Total dropped: {self.dropped_write_frames}")
                 
                 if self.en_streaming and check_frame_flag:
                     self.stream_descriptor.write(self.iq_frame_bytes)
@@ -364,7 +443,7 @@ class IQStreamer:
             
             stdscr.clear()
             stdscr.addstr(0,  0,"--->HeIMDALL IQ Frame Streamer and Recorder<---")
-            stdscr.addstr(1,  0,"Version: 1.0-230721")            
+            stdscr.addstr(1,  0,"Version: 1.3-251111")            
             stdscr.addstr(2,  0,"q   : exit program")
             stdscr.addstr(3,  0,"c/d : Connection/Disconnect IQ server")
             stdscr.addstr(4,  0,"s/x : Start/Stop streaming to file")
@@ -384,9 +463,19 @@ class IQStreamer:
             stdscr.addstr(19, 0, "Recording into :"+record_fname_str)
             stdscr.addstr(20, 0, "Recorded frames:"+str(self.recorded_frames))
             stdscr.addstr(21, 0, "Recorded data size:"+recorded_data_size_str)
-            stdscr.addstr(22, 0, "Used space on disk:"+progress_bar+" {:d}%".format(disk_used_percent))                
             
-            stdscr.addstr(24, 0, "Status: "+self.status_msg)
+            # Display writer queue status and dropped frames
+            if self.en_save_iq and self.writer_queue is not None:
+                queue_size = self.writer_queue.qsize()
+                queue_status_color = 2 if queue_size < self.queue_depth * 0.8 else 1
+                stdscr.addstr(22, 0, f"Writer queue: {queue_size}/{self.queue_depth}", curses.color_pair(queue_status_color))
+                if self.dropped_write_frames > 0:
+                    stdscr.addstr(23, 0, f"Dropped write frames: {self.dropped_write_frames}", curses.color_pair(1))
+                else:
+                    stdscr.addstr(23, 0, "Dropped write frames: 0", curses.color_pair(2))
+            stdscr.addstr(24, 0, "Used space on disk:"+progress_bar+" {:d}%".format(disk_used_percent))                
+            
+            stdscr.addstr(26, 0, "Status: "+self.status_msg)
             
             stdscr.refresh()
         stdscr.keypad(0)
